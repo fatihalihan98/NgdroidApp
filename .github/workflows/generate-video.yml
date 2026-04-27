@@ -1,0 +1,150 @@
+name: Generate Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_path:
+        description: "Script JSON file path (relative to repo root)"
+        required: true
+        default: "automation/video_generator/mosque_script.json"
+      script_json:
+        description: "Inline script JSON (overrides script_path when non-empty)"
+        required: false
+        default: ""
+      voice_id:
+        description: "ElevenLabs voice ID"
+        required: true
+        default: "ErXwobaYiN019PkySvjV"
+      orientation:
+        description: "Orientation"
+        required: true
+        default: "landscape"
+        type: choice
+        options:
+          - landscape
+          - portrait
+          - square
+      resolution:
+        description: "Resolution"
+        required: true
+        default: "1080p"
+        type: choice
+        options:
+          - 720p
+          - 1080p
+      fps:
+        description: "Frames per second"
+        required: true
+        default: "30"
+        type: choice
+        options:
+          - "24"
+          - "30"
+          - "60"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: automation/video_generator/requirements.txt
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -y && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install Python deps
+        run: pip install -r automation/video_generator/requirements.txt
+
+      - name: Resolve script source
+        id: script
+        env:
+          INLINE_JSON: ${{ inputs.script_json }}
+          DEFAULT_PATH: ${{ inputs.script_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INLINE_JSON" ]; then
+            mkdir -p "$RUNNER_TEMP/script"
+            printf '%s' "$INLINE_JSON" > "$RUNNER_TEMP/script/inline.json"
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$RUNNER_TEMP/script/inline.json"
+            echo "path=$RUNNER_TEMP/script/inline.json" >> "$GITHUB_OUTPUT"
+            echo "label=inline" >> "$GITHUB_OUTPUT"
+          else
+            test -f "$GITHUB_WORKSPACE/$DEFAULT_PATH" \
+              || { echo "Script not found: $DEFAULT_PATH"; exit 1; }
+            echo "path=$GITHUB_WORKSPACE/$DEFAULT_PATH" >> "$GITHUB_OUTPUT"
+            echo "label=$DEFAULT_PATH" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute output size
+        id: size
+        env:
+          RES: ${{ inputs.resolution }}
+          ORI: ${{ inputs.orientation }}
+        run: |
+          set -euo pipefail
+          case "$RES" in
+            720p)  long=1280; short=720 ;;
+            1080p) long=1920; short=1080 ;;
+          esac
+          case "$ORI" in
+            landscape) w=$long;  h=$short ;;
+            portrait)  w=$short; h=$long ;;
+            square)    w=$short; h=$short ;;
+          esac
+          echo "width=$w"  >> "$GITHUB_OUTPUT"
+          echo "height=$h" >> "$GITHUB_OUTPUT"
+          echo "Resolved size: ${w}x${h}"
+
+      - name: Generate video
+        working-directory: automation/video_generator
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ inputs.voice_id }}
+          ELEVENLABS_MODEL_ID: eleven_multilingual_v2
+        run: |
+          set -euo pipefail
+          python main.py "${{ steps.script.outputs.path }}" \
+            --output output/video.mp4 \
+            --orientation ${{ inputs.orientation }} \
+            --width  ${{ steps.size.outputs.width  }} \
+            --height ${{ steps.size.outputs.height }} \
+            --fps    ${{ inputs.fps }}
+
+      - name: Upload video artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ github.run_id }}
+          path: automation/video_generator/output/video.mp4
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        env:
+          SCRIPT_LABEL: ${{ steps.script.outputs.label }}
+          VOICE_ID: ${{ inputs.voice_id }}
+          ORI: ${{ inputs.orientation }}
+          W: ${{ steps.size.outputs.width }}
+          H: ${{ steps.size.outputs.height }}
+          FPS: ${{ inputs.fps }}
+        run: |
+          {
+            echo "## Video generation"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Script | \`$SCRIPT_LABEL\` |"
+            echo "| Voice  | \`$VOICE_ID\` |"
+            echo "| Size   | ${W}x${H} ($ORI) |"
+            echo "| FPS    | $FPS |"
+            echo ""
+            echo "Download the mp4 from the **Artifacts** section on this run page."
+          } >> "$GITHUB_STEP_SUMMARY"
